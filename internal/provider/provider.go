@@ -32,18 +32,20 @@ type VLESS struct {
 }
 
 type VMess struct {
-	Address  string `json:"add"`
-	Port     string `json:"port"`
-	ID       string `json:"id"`
-	AlterID  string `json:"aid"`
-	Network  string `json:"net"`
-	Host     string `json:"host"`
-	Path     string `json:"path"`
-	TLS      string `json:"tls"`
-	SNI      string `json:"sni"`
-	ALPN     string `json:"alpn"`
-	Type     string `json:"type"`
-	Security string `json:"scy"`
+	Address      string          `json:"add"`
+	PortRaw      json.RawMessage `json:"port"`
+	ID           string          `json:"id"`
+	AlterIDRaw   json.RawMessage `json:"aid"`
+	Network      string          `json:"net"`
+	Host         string          `json:"host"`
+	Path         string          `json:"path"`
+	TLS          string          `json:"tls"`
+	SNI          string          `json:"sni"`
+	ALPN         string          `json:"alpn"`
+	Type         string          `json:"type"`
+	Security     string          `json:"scy"`
+	Port         int             `json:"-"`
+	AlterID      int             `json:"-"`
 }
 
 func FromURI(raw string) (Provider, error) {
@@ -116,8 +118,22 @@ func parseVMess(raw string) (Provider, error) {
 		return nil, fmt.Errorf("vmess JSON decode failed: %w", err)
 	}
 
-	if vm.Address == "" || vm.Port == "" || vm.ID == "" {
+	port, err := parseIntField(vm.PortRaw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid vmess port: %w", err)
+	}
+	if vm.Address == "" || vm.ID == "" {
 		return nil, errors.New("vmess JSON missing add/port/id")
+	}
+	vm.Port = port
+	if vm.Port <= 0 || vm.Port > 65535 {
+		return nil, errors.New("vmess port out of range")
+	}
+	if len(vm.AlterIDRaw) > 0 {
+		aid, err := parseIntField(vm.AlterIDRaw)
+		if err == nil {
+			vm.AlterID = aid
+		}
 	}
 	if vm.Network == "" {
 		vm.Network = "tcp"
@@ -182,27 +198,16 @@ func (v *VLESS) Outbound() (map[string]any, error) {
 func (v *VMess) Name() string { return "vmess" }
 
 func (v *VMess) Outbound() (map[string]any, error) {
-	port, err := strconv.Atoi(v.Port)
-	if err != nil {
-		return nil, fmt.Errorf("invalid vmess port: %w", err)
-	}
-	alterID := 0
-	if v.AlterID != "" {
-		if a, err := strconv.Atoi(v.AlterID); err == nil {
-			alterID = a
-		}
-	}
-
 	out := map[string]any{
 		"tag":      "proxy",
 		"protocol": "vmess",
 		"settings": map[string]any{
 			"vnext": []any{map[string]any{
 				"address": v.Address,
-				"port":    port,
+				"port":    v.Port,
 				"users": []any{map[string]any{
 					"id":       v.ID,
-					"alterId":  alterID,
+					"alterId":  v.AlterID,
 					"security": valueOrDefault(v.Security, "auto"),
 				}},
 			}},
@@ -216,6 +221,19 @@ func (v *VMess) Outbound() (map[string]any, error) {
 	stream := map[string]any{
 		"network":  valueOrDefault(v.Network, "tcp"),
 		"security": security,
+	}
+	if strings.EqualFold(v.Network, "tcp") && strings.EqualFold(v.Type, "http") {
+		stream["tcpSettings"] = map[string]any{
+			"header": map[string]any{
+				"type": "http",
+				"request": map[string]any{
+					"path": toPathList(v.Path),
+					"headers": map[string]any{
+						"Host": toHostList(v.Host),
+					},
+				},
+			},
+		}
 	}
 	if v.Network == "ws" {
 		stream["wsSettings"] = map[string]any{
@@ -233,6 +251,32 @@ func (v *VMess) Outbound() (map[string]any, error) {
 	}
 	out["streamSettings"] = stream
 	return out, nil
+}
+
+func parseIntField(raw json.RawMessage) (int, error) {
+	if len(raw) == 0 {
+		return 0, errors.New("empty field")
+	}
+
+	var asInt int
+	if err := json.Unmarshal(raw, &asInt); err == nil {
+		return asInt, nil
+	}
+
+	var asStr string
+	if err := json.Unmarshal(raw, &asStr); err == nil {
+		asStr = strings.TrimSpace(asStr)
+		if asStr == "" {
+			return 0, errors.New("empty string")
+		}
+		n, err := strconv.Atoi(asStr)
+		if err != nil {
+			return 0, err
+		}
+		return n, nil
+	}
+
+	return 0, errors.New("expected number or numeric string")
 }
 
 func decodeBase64Any(s string) ([]byte, error) {
@@ -280,4 +324,19 @@ func splitCSV(v string) []string {
 		return nil
 	}
 	return out
+}
+
+func toHostList(v string) []string {
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
+	return splitCSV(v)
+}
+
+func toPathList(v string) []string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return []string{"/"}
+	}
+	return []string{v}
 }
