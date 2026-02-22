@@ -5,83 +5,53 @@
 [![Go Version](https://img.shields.io/github/go-mod/go-version/v2rayhub/health-node)](https://github.com/v2rayhub/health-node/blob/main/go.mod)
 
 Small V2Ray/Xray client utility for Linux and macOS.
-It can quickly open a local SOCKS/HTTP proxy from a URI (`vless://`, `vmess://`, `ss://`), run health checks, and run speed tests.
+It can open local SOCKS/HTTP proxy from `vless://`, `vmess://`, `ss://`, run health checks, and run speed tests.
 
-## Releases
+## How To Use
 
-Download prebuilt binaries from:
+### Download / Build
+
+Prebuilt binaries:
 
 https://github.com/v2rayhub/health-node/releases
 
-## 1) Build
+Or build locally:
 
 ```bash
 go build -o health-node ./cmd/health-node
 ```
 
-## 2) Install core (no manual download needed)
-
-Default (installs latest Xray core into current directory):
+### Install Core (Automatic)
 
 ```bash
 ./health-node install-core
 ```
 
-Other examples:
+Examples:
 
 ```bash
-# install specific Xray tag
+# specific Xray version
 ./health-node install-core --repo XTLS/Xray-core --version v26.2.6
 
-# install v2ray-core into ./core directory
+# v2ray-core into ./core
 ./health-node install-core --repo v2fly/v2ray-core --version v5.20.0 --dest ./core
 
-# overwrite existing binary
+# overwrite existing core binary
 ./health-node install-core --force
 ```
 
-After install, `probe` and `speed` auto-detect core from:
-- same directory as `health-node` (`./xray` or `./v2ray`)
-- `./core/xray` or `./core/v2ray`
-- `PATH` (fallback)
+Core auto-detection order:
+- same folder: `./xray` or `./v2ray`
+- subfolder: `./core/xray` or `./core/v2ray`
+- `PATH` fallback
 
-## 3) Check connectivity
+### Open Local Proxy (Main Mode)
 
-```bash
-./health-node probe --uri 'vless://UUID@server.example.com:443?type=ws&security=tls&host=server.example.com&path=%2Fws&sni=server.example.com'
-```
-
-VMess example:
-
-```bash
-./health-node probe --uri 'vmess://BASE64_JSON'
-```
-
-## 4) Run speed test
-
-```bash
-./health-node speed --uri 'vmess://BASE64_JSON'
-```
-
-With options:
-
-```bash
-./health-node speed \
-  --uri 'vmess://BASE64_JSON' \
-  --url 'https://speed.hetzner.de/10MB.bin' \
-  --max-bytes 10485760 \
-  --timeout 45s
-```
-
-## 5) Open local proxy port (long-running)
-
-SOCKS5 proxy (default):
+SOCKS5 (default):
 
 ```bash
 ./health-node proxy --uri 'vmess://BASE64_JSON' --local-port 1080
 ```
-
-This is the easiest way to use it as a local V2Ray client.
 
 HTTP proxy:
 
@@ -89,80 +59,98 @@ HTTP proxy:
 ./health-node proxy --uri 'vmess://BASE64_JSON' --inbound http --local-port 8080
 ```
 
-`socks` is an alias of `proxy --inbound socks`.
+Notes:
+- `socks` is alias for `proxy --inbound socks`
+- Traffic monitor is on by default
+- Disable traffic monitor with `--no-traffic`
+- Tune refresh cost with `--traffic-interval 2s` (or slower, e.g. `5s`)
 
-Traffic UI behavior:
-- In an interactive terminal, traffic is shown in a `tview` dashboard (top-style panels).
-- In non-interactive output (logs/CI), traffic is printed as periodic lines.
-- Disable with `--no-traffic`.
+### Health Check / Speed Test
 
-## Optional flags
+Connectivity probe:
 
-```text
---core <path>         Explicit core path override
---local-socks <port>  Local SOCKS5 port (auto-random if not set)
---timeout <duration>  Command timeout (example: 20s, 1m)
+```bash
+./health-node probe --uri 'vless://UUID@server.example.com:443?type=ws&security=tls&host=server.example.com&path=%2Fws&sni=server.example.com'
 ```
 
-## Help
+Speed test:
+
+```bash
+./health-node speed \
+  --uri 'vmess://BASE64_JSON' \
+  --url 'https://ash-speed.hetzner.com/1GB.bin' \
+  --max-bytes 0 \
+  --timeout 5m
+```
+
+Help:
 
 ```bash
 ./health-node --help
+./health-node proxy --help
 ./health-node probe --help
 ./health-node speed --help
 ./health-node install-core --help
 ```
 
-## Development Cycle
+## How To Develop And Extend
 
-Typical local loop:
+### Local Dev Cycle
 
 ```bash
-# 1) format (if gofmt is installed)
+# format
 gofmt -w ./cmd ./internal
 
-# 2) run tests
+# test
 go test ./...
 
-# 3) build binary
+# build
 go build -o health-node ./cmd/health-node
-
-# 4) smoke test help
-./health-node --help
 ```
 
 Targeted tests:
 
 ```bash
-go test ./internal/provider -run VMess -v
+go test ./internal/provider -v
 ```
 
-## Architecture Notes
+### Project Structure
 
 - `cmd/health-node/main.go`
-Parses CLI args and orchestrates commands (`probe`, `speed`, `install-core`).
-
-- `internal/provider`
-Parses subscription URIs (`vless://`, `vmess://`) and converts them into outbound config blocks.
+CLI commands and runtime orchestration.
 
 - `internal/core`
-Creates temporary runtime config, starts/stops Xray/V2Ray process, and exposes log tail for errors.
+Core process/config runner for xray/v2ray.
 
-- `internal/proxy`
-Minimal SOCKS5 client used by HTTP probe/speed requests.
+- `internal/provider`
+Protocol parsers and outbound builders.
+
+- `internal/provider/registry.go`
+Parser interface/registry for protocol extension.
 
 - `internal/installer`
-Downloads matching core release from GitHub and installs executable locally.
+GitHub release downloader/installer for core binaries.
 
-## GitHub Release Automation
+- `internal/proxy`
+SOCKS5 client used by probe/speed code paths.
 
-Tag push triggers a multi-platform release workflow (`.github/workflows/release.yml`) that builds and uploads downloadable assets.
+### Add A New Protocol
 
-Example:
+1. Add a protocol file in `internal/provider/` (for example `trojan.go`).
+2. Implement parser + provider output using existing pattern:
+- parser implements `URIParser`
+- provider struct implements `Provider`
+3. Register parser in `internal/provider/registry.go` default registry.
+4. Add tests in `internal/provider/*_test.go` for parse + outbound generation.
+
+### Release Automation
+
+Tag push triggers multi-platform release build and upload:
 
 ```bash
 git tag v0.1.0
 git push origin v0.1.0
 ```
 
-Release assets include Linux, macOS, and Windows binaries plus `checksums.txt`.
+Workflow file:
+- `.github/workflows/release.yml`
