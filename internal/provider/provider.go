@@ -223,15 +223,18 @@ func (v *VMess) Outbound() (map[string]any, error) {
 		"security": security,
 	}
 	if strings.EqualFold(v.Network, "tcp") && strings.EqualFold(v.Type, "http") {
+		request := map[string]any{
+			"path": toPathList(v.Path),
+		}
+		if hosts := toHostList(v.Host); len(hosts) > 0 {
+			request["headers"] = map[string]any{
+				"Host": hosts,
+			}
+		}
 		stream["tcpSettings"] = map[string]any{
 			"header": map[string]any{
 				"type": "http",
-				"request": map[string]any{
-					"path": toPathList(v.Path),
-					"headers": map[string]any{
-						"Host": toHostList(v.Host),
-					},
-				},
+				"request": request,
 			},
 		}
 	}
