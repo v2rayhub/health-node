@@ -1,82 +1,121 @@
 # health-node
 
-Small dependency-free Go CLI to validate V2Ray/Xray outbound configs (currently `vless://` and `vmess://`) on Linux VMs.
+Small CLI to check V2Ray/Xray outbound health (`vless://`, `vmess://`) and run speed tests.
 
-## Build
+## 1) Build
 
 ```bash
 go build -o health-node ./cmd/health-node
 ```
 
-## Requirements
+## 2) Install core (no manual download needed)
 
-- Linux VM
-- V2Ray or Xray core binary available. Preferred packaging is to ship it with `health-node`.
-
-## Bundle the core (recommended)
-
-Put files in one folder:
-
-```text
-deploy/
-  health-node
-  xray
-```
-
-Then run without `--core`; the CLI auto-detects:
-- `./xray` or `./v2ray` next to `health-node`
-- `./core/xray` or `./core/v2ray` next to `health-node`
-- `xray`/`v2ray` in `PATH` (fallback)
-
-## Auto download/install core
-
-You can let the CLI install core from GitHub releases:
+Default (installs latest Xray core into current directory):
 
 ```bash
 ./health-node install-core
 ```
 
-Examples:
+Other examples:
 
 ```bash
-# default: latest from XTLS/Xray-core into current directory
-./health-node install-core
+# install specific Xray tag
+./health-node install-core --repo XTLS/Xray-core --version v26.2.6
 
-# specific repo/tag and destination directory
+# install v2ray-core into ./core directory
 ./health-node install-core --repo v2fly/v2ray-core --version v5.20.0 --dest ./core
+
+# overwrite existing binary
+./health-node install-core --force
 ```
 
-## Probe connectivity
+After install, `probe` and `speed` auto-detect core from:
+- same directory as `health-node` (`./xray` or `./v2ray`)
+- `./core/xray` or `./core/v2ray`
+- `PATH` (fallback)
+
+## 3) Check connectivity
 
 ```bash
-./health-node probe \
-  --uri 'vless://UUID@server.example.com:443?type=ws&security=tls&host=server.example.com&path=%2Fws&sni=server.example.com'
+./health-node probe --uri 'vless://UUID@server.example.com:443?type=ws&security=tls&host=server.example.com&path=%2Fws&sni=server.example.com'
 ```
 
-Output example:
+VMess example:
 
-```text
-status=ok protocol=vless code=204 latency_ms=890 bytes=0
+```bash
+./health-node probe --uri 'vmess://BASE64_JSON'
 ```
 
-## Speed test
+## 4) Run speed test
+
+```bash
+./health-node speed --uri 'vmess://BASE64_JSON'
+```
+
+With options:
 
 ```bash
 ./health-node speed \
-  --uri 'vmess://eyJhZGQiOiJzZXJ2ZXIuZXhhbXBsZS5jb20iLCJwb3J0IjoiNDQzIiwiaWQiOiJVVUlEIiwiYWlkIjoiMCIsIm5ldCI6IndzIiwiaG9zdCI6InNlcnZlci5leGFtcGxlLmNvbSIsInBhdGgiOiIvd3MiLCJ0bHMiOiJ0bHMifQ==' \
-  --max-bytes 10485760
+  --uri 'vmess://BASE64_JSON' \
+  --url 'https://speed.hetzner.de/10MB.bin' \
+  --max-bytes 10485760 \
+  --timeout 45s
 ```
 
-Output example:
+## Optional flags
 
 ```text
-status=ok protocol=vmess bytes=10485760 elapsed_ms=4200 mbps=19.97
+--core <path>         Explicit core path override
+--local-socks <port>  Local SOCKS5 port (auto-random if not set)
+--timeout <duration>  Command timeout (example: 20s, 1m)
 ```
 
-## Notes
+## Help
 
-- CLI generates a temporary core config with local SOCKS5 inbound at `127.0.0.1:<port>`.
-- Only standard library is used.
-- URI parser currently focuses on common VMess/VLESS fields (TCP/WS/gRPC and TLS basics).
-- Architecture is split by package so you can add new providers (for example WireGuard) later.
-- You can still override core path explicitly with `--core /path/to/xray`.
+```bash
+./health-node --help
+./health-node probe --help
+./health-node speed --help
+./health-node install-core --help
+```
+
+## Development Cycle
+
+Typical local loop:
+
+```bash
+# 1) format (if gofmt is installed)
+gofmt -w ./cmd ./internal
+
+# 2) run tests
+go test ./...
+
+# 3) build binary
+go build -o health-node ./cmd/health-node
+
+# 4) smoke test help
+./health-node --help
+```
+
+Targeted tests:
+
+```bash
+go test ./internal/provider -run VMess -v
+```
+
+## Architecture Notes
+
+- `cmd/health-node/main.go`
+Parses CLI args and orchestrates commands (`probe`, `speed`, `install-core`).
+
+- `internal/provider`
+Parses subscription URIs (`vless://`, `vmess://`) and converts them into outbound config blocks.
+
+- `internal/core`
+Creates temporary runtime config, starts/stops Xray/V2Ray process, and exposes log tail for errors.
+
+- `internal/proxy`
+Minimal SOCKS5 client used by HTTP probe/speed requests.
+
+- `internal/installer`
+Downloads matching core release from GitHub and installs executable locally.
