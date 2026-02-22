@@ -62,6 +62,22 @@ With options:
   --timeout 45s
 ```
 
+## 5) Open local proxy port (long-running)
+
+SOCKS5 proxy (default):
+
+```bash
+./health-node proxy --uri 'vmess://BASE64_JSON' --local-port 1080
+```
+
+HTTP proxy:
+
+```bash
+./health-node proxy --uri 'vmess://BASE64_JSON' --inbound http --local-port 8080
+```
+
+`socks` is an alias of `proxy --inbound socks`.
+
 ## Optional flags
 
 ```text

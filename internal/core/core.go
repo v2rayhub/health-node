@@ -12,9 +12,10 @@ import (
 )
 
 type Runner struct {
-	CorePath string
-	Port     int
-	Timeout  time.Duration
+	CorePath        string
+	Port            int
+	Timeout         time.Duration
+	InboundProtocol string
 }
 
 type Started struct {
@@ -30,17 +31,28 @@ func (r Runner) Start(ctx context.Context, outbound map[string]any) (*Started, e
 	if r.Port == 0 {
 		return nil, fmt.Errorf("local socks port is required")
 	}
+	inboundProtocol := strings.TrimSpace(r.InboundProtocol)
+	if inboundProtocol == "" {
+		inboundProtocol = "socks"
+	}
+	if inboundProtocol != "socks" && inboundProtocol != "http" {
+		return nil, fmt.Errorf("unsupported inbound protocol %q", inboundProtocol)
+	}
+
+	inbound := map[string]any{
+		"listen":   "127.0.0.1",
+		"port":     r.Port,
+		"protocol": inboundProtocol,
+	}
+	if inboundProtocol == "socks" {
+		inbound["settings"] = map[string]any{"udp": false}
+	}
 
 	cfg := map[string]any{
 		"log": map[string]any{
 			"loglevel": "warning",
 		},
-		"inbounds": []any{map[string]any{
-			"listen":   "127.0.0.1",
-			"port":     r.Port,
-			"protocol": "socks",
-			"settings": map[string]any{"udp": false},
-		}},
+		"inbounds": []any{inbound},
 		"outbounds": []any{
 			outbound,
 			map[string]any{"tag": "direct", "protocol": "freedom"},

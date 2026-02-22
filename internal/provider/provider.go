@@ -55,6 +55,21 @@ type VMess struct {
 	AlterID      int             `json:"-"`
 }
 
+type Shadowsocks struct {
+	Address     string
+	Port        int
+	Method      string
+	Password    string
+	Network     string
+	Security    string
+	HeaderType  string
+	Host        string
+	Path        string
+	SNI         string
+	ALPN        string
+	Service     string
+}
+
 func FromURI(raw string) (Provider, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -66,8 +81,10 @@ func FromURI(raw string) (Provider, error) {
 		return parseVLESS(u)
 	case "vmess":
 		return parseVMess(raw)
+	case "ss":
+		return parseShadowsocks(raw)
 	default:
-		return nil, fmt.Errorf("unsupported scheme %q (supported: vless, vmess)", u.Scheme)
+		return nil, fmt.Errorf("unsupported scheme %q (supported: vless, vmess, ss)", u.Scheme)
 	}
 }
 
@@ -159,6 +176,84 @@ func parseVMess(raw string) (Provider, error) {
 	return &vm, nil
 }
 
+func parseShadowsocks(raw string) (Provider, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid ss URI: %w", err)
+	}
+
+	server := u.Host
+	credPart := ""
+	if strings.Contains(raw, "@") {
+		trimmed := strings.TrimPrefix(raw, "ss://")
+		if i := strings.Index(trimmed, "#"); i >= 0 {
+			trimmed = trimmed[:i]
+		}
+		if i := strings.Index(trimmed, "?"); i >= 0 {
+			trimmed = trimmed[:i]
+		}
+		at := strings.LastIndex(trimmed, "@")
+		if at > 0 {
+			credPart = trimmed[:at]
+			server = trimmed[at+1:]
+		}
+	}
+
+	method := ""
+	password := ""
+
+	// SIP002 commonly uses base64(method:password) before '@'.
+	if credPart != "" {
+		if b, err := decodeBase64Any(credPart); err == nil {
+			if m, p, ok := strings.Cut(string(b), ":"); ok {
+				method, password = m, p
+			}
+		}
+		if method == "" {
+			if m, p, ok := strings.Cut(credPart, ":"); ok {
+				method, password = m, p
+			}
+		}
+	} else if u.User != nil {
+		// Alternate style: ss://base64(method:password) without @host in parsing fallback.
+		user := u.User.Username()
+		if b, err := decodeBase64Any(user); err == nil {
+			if m, p, ok := strings.Cut(string(b), ":"); ok {
+				method, password = m, p
+			}
+		}
+	}
+
+	if method == "" || password == "" {
+		return nil, errors.New("ss URI missing method/password")
+	}
+
+	host, portStr, err := net.SplitHostPort(server)
+	if err != nil {
+		return nil, fmt.Errorf("ss host/port parse failed: %w", err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, errors.New("invalid ss port")
+	}
+
+	q := u.Query()
+	return &Shadowsocks{
+		Address:    host,
+		Port:       port,
+		Method:     method,
+		Password:   password,
+		Network:    valueOrDefault(q.Get("type"), "tcp"),
+		Security:   valueOrDefault(q.Get("security"), "none"),
+		HeaderType: q.Get("headerType"),
+		Host:       q.Get("host"),
+		Path:       q.Get("path"),
+		SNI:        q.Get("sni"),
+		ALPN:       q.Get("alpn"),
+		Service:    q.Get("serviceName"),
+	}, nil
+}
+
 func (v *VLESS) Name() string { return "vless" }
 
 func (v *VLESS) Outbound() (map[string]any, error) {
@@ -244,6 +339,8 @@ func (v *VLESS) Outbound() (map[string]any, error) {
 
 func (v *VMess) Name() string { return "vmess" }
 
+func (s *Shadowsocks) Name() string { return "shadowsocks" }
+
 func (v *VMess) Outbound() (map[string]any, error) {
 	out := map[string]any{
 		"tag":      "proxy",
@@ -299,6 +396,65 @@ func (v *VMess) Outbound() (map[string]any, error) {
 			"alpn":       splitCSV(v.ALPN),
 		}
 	}
+	out["streamSettings"] = stream
+	return out, nil
+}
+
+func (s *Shadowsocks) Outbound() (map[string]any, error) {
+	out := map[string]any{
+		"tag":      "proxy",
+		"protocol": "shadowsocks",
+		"settings": map[string]any{
+			"servers": []any{map[string]any{
+				"address":  s.Address,
+				"port":     s.Port,
+				"method":   s.Method,
+				"password": s.Password,
+			}},
+		},
+	}
+
+	stream := map[string]any{
+		"network":  valueOrDefault(s.Network, "tcp"),
+		"security": valueOrDefault(s.Security, "none"),
+	}
+	if strings.EqualFold(s.Network, "tcp") && strings.EqualFold(s.HeaderType, "http") {
+		request := map[string]any{
+			"path": toPathList(s.Path),
+		}
+		if hosts := toHostList(s.Host); len(hosts) > 0 {
+			request["headers"] = map[string]any{
+				"Host": hosts,
+			}
+		}
+		stream["tcpSettings"] = map[string]any{
+			"header": map[string]any{
+				"type":    "http",
+				"request": request,
+			},
+		}
+	}
+	if strings.EqualFold(s.Network, "ws") {
+		ws := map[string]any{
+			"path": valueOrDefault(s.Path, "/"),
+		}
+		if strings.TrimSpace(s.Host) != "" {
+			ws["headers"] = map[string]any{"Host": s.Host}
+		}
+		stream["wsSettings"] = ws
+	}
+	if strings.EqualFold(s.Network, "grpc") {
+		stream["grpcSettings"] = map[string]any{
+			"serviceName": s.Service,
+		}
+	}
+	if strings.EqualFold(s.Security, "tls") {
+		stream["tlsSettings"] = map[string]any{
+			"serverName": firstNonEmpty(s.SNI, s.Host, s.Address),
+			"alpn":       splitCSV(s.ALPN),
+		}
+	}
+
 	out["streamSettings"] = stream
 	return out, nil
 }

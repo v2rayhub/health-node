@@ -12,8 +12,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"health-node/internal/core"
@@ -40,6 +42,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "speed failed: %v\n", err)
 			os.Exit(1)
 		}
+	case "socks":
+		if err := runProxy(os.Args[2:], "socks"); err != nil {
+			fmt.Fprintf(os.Stderr, "socks failed: %v\n", err)
+			os.Exit(1)
+		}
+	case "proxy":
+		if err := runProxy(os.Args[2:], "socks"); err != nil {
+			fmt.Fprintf(os.Stderr, "proxy failed: %v\n", err)
+			os.Exit(1)
+		}
 	case "install-core":
 		if err := runInstallCore(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "install-core failed: %v\n", err)
@@ -64,6 +76,8 @@ Usage:
 Commands:
   probe   Start core with generated config and run an HTTP probe through SOCKS5.
   speed   Start core and measure download speed through SOCKS5.
+  socks   Alias of proxy --inbound socks.
+  proxy   Start core and keep a local proxy (SOCKS5/HTTP) port open until interrupted.
   install-core  Download and install Xray/V2Ray core from GitHub release.
 
 Common flags:
@@ -78,6 +92,11 @@ Probe flags:
 Speed flags:
   --url string          download URL (default: https://speed.hetzner.de/10MB.bin)
   --max-bytes int       stop after N bytes (0 means full response)
+
+Proxy flags:
+  --inbound string      inbound protocol: socks|http (default: socks)
+  --local-port int      local proxy listen port (default: 1080 for socks, 8080 for http)
+  --timeout duration    startup timeout (default: 20s)
 
 Install-core flags:
   --repo string         GitHub repo owner/name (default: XTLS/Xray-core)
@@ -222,6 +241,72 @@ func runInstallCore(args []string) error {
 		return err
 	}
 	fmt.Printf("status=ok repo=%s version=%s installed=%s\n", *repo, tag, path)
+	return nil
+}
+
+func runProxy(args []string, defaultInbound string) error {
+	fs := flag.NewFlagSet("proxy", flag.ContinueOnError)
+	uri := fs.String("uri", "", "VLESS/VMess URI")
+	corePath := fs.String("core", "", "core binary path")
+	inbound := fs.String("inbound", defaultInbound, "inbound protocol: socks|http")
+	localPort := fs.Int("local-port", 0, "local proxy listen port")
+	timeout := fs.Duration("timeout", 20*time.Second, "startup timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *uri == "" {
+		return errors.New("--uri is required")
+	}
+	*inbound = strings.ToLower(strings.TrimSpace(*inbound))
+	if *inbound != "socks" && *inbound != "http" {
+		return errors.New("--inbound must be socks or http")
+	}
+	if *localPort == 0 {
+		if *inbound == "http" {
+			*localPort = 8080
+		} else {
+			*localPort = 1080
+		}
+	}
+	if *localPort <= 0 || *localPort > 65535 {
+		return errors.New("--local-port must be in range 1..65535")
+	}
+
+	resolvedCore, err := resolveCorePath(*corePath)
+	if err != nil {
+		return err
+	}
+
+	prov, err := provider.FromURI(*uri)
+	if err != nil {
+		return err
+	}
+	outbound, err := prov.Outbound()
+	if err != nil {
+		return err
+	}
+
+	r := core.Runner{CorePath: resolvedCore, Port: *localPort, Timeout: *timeout, InboundProtocol: *inbound}
+	started, err := r.Start(context.Background(), outbound)
+	if err != nil {
+		return err
+	}
+	defer started.Stop()
+
+	socksAddr := fmt.Sprintf("127.0.0.1:%d", *localPort)
+	startupCtx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	if err := waitSocks(startupCtx, socksAddr, *timeout); err != nil {
+		return fmt.Errorf("core did not become ready: %w\ncore log tail:\n%s", err, started.ReadLogTail())
+	}
+
+	fmt.Printf("status=ok mode=proxy inbound=%s protocol=%s listen=%s\n", *inbound, prov.Name(), socksAddr)
+	fmt.Println("running until interrupted (Ctrl+C)")
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	<-sigCh
 	return nil
 }
 
