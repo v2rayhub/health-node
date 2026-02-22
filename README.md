@@ -1,6 +1,17 @@
 # health-node
 
-Small CLI to check V2Ray/Xray outbound health (`vless://`, `vmess://`) and run speed tests.
+[![Release](https://img.shields.io/github/v/release/v2rayhub/health-node)](https://github.com/v2rayhub/health-node/releases)
+[![Release Workflow](https://github.com/v2rayhub/health-node/actions/workflows/release.yml/badge.svg)](https://github.com/v2rayhub/health-node/actions/workflows/release.yml)
+[![Go Version](https://img.shields.io/github/go-mod/go-version/v2rayhub/health-node)](https://github.com/v2rayhub/health-node/blob/main/go.mod)
+
+Small V2Ray/Xray client utility for Linux and macOS.
+It can quickly open a local SOCKS/HTTP proxy from a URI (`vless://`, `vmess://`, `ss://`), run health checks, and run speed tests.
+
+## Releases
+
+Download prebuilt binaries from:
+
+https://github.com/v2rayhub/health-node/releases
 
 ## 1) Build
 
@@ -70,6 +81,8 @@ SOCKS5 proxy (default):
 ./health-node proxy --uri 'vmess://BASE64_JSON' --local-port 1080
 ```
 
+This is the easiest way to use it as a local V2Ray client.
+
 HTTP proxy:
 
 ```bash
@@ -79,7 +92,7 @@ HTTP proxy:
 `socks` is an alias of `proxy --inbound socks`.
 
 Traffic UI behavior:
-- In an interactive terminal, traffic is shown as a live dashboard (top-style refresh).
+- In an interactive terminal, traffic is shown in a `tview` dashboard (top-style panels).
 - In non-interactive output (logs/CI), traffic is printed as periodic lines.
 - Disable with `--no-traffic`.
 

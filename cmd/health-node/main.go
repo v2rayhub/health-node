@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -15,16 +16,18 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/rivo/tview"
+
 	"health-node/internal/core"
 	"health-node/internal/installer"
-	"health-node/internal/proxy"
 	"health-node/internal/provider"
+	"health-node/internal/proxy"
 )
 
 func main() {
@@ -101,6 +104,7 @@ Proxy flags:
   --local-port int      local proxy listen port (default: 1080 for socks, 8080 for http)
   --print-requests      stream core log lines while running
   --no-traffic          disable live uplink/downlink bytes per second output
+  --traffic-interval    traffic refresh interval (default: 2s)
   --timeout duration    startup timeout (default: 20s)
 
 Install-core flags:
@@ -257,6 +261,7 @@ func runProxy(args []string, defaultInbound string) error {
 	localPort := fs.Int("local-port", 0, "local proxy listen port")
 	printRequests := fs.Bool("print-requests", false, "stream core log lines")
 	noTraffic := fs.Bool("no-traffic", false, "disable live traffic counters")
+	trafficInterval := fs.Duration("traffic-interval", 2*time.Second, "traffic refresh interval")
 	timeout := fs.Duration("timeout", 20*time.Second, "startup timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -289,6 +294,9 @@ func runProxy(args []string, defaultInbound string) error {
 		return err
 	}
 	showTraffic := !*noTraffic
+	if *trafficInterval < 200*time.Millisecond {
+		*trafficInterval = 200 * time.Millisecond
+	}
 
 	outbound, err := prov.Outbound()
 	if err != nil {
@@ -364,7 +372,6 @@ func runProxy(args []string, defaultInbound string) error {
 	}
 	if showTraffic {
 		wg.Add(1)
-		dashboardMode := isInteractiveTTY() && !*printRequests
 		meta := dashboardMeta{
 			Listen:   listenAddr,
 			Inbound:  *inbound,
@@ -374,7 +381,14 @@ func runProxy(args []string, defaultInbound string) error {
 		}
 		go func() {
 			defer wg.Done()
-			meter.run(stopTraffic, dashboardMode, meta)
+			if isInteractiveTTY() && !*printRequests {
+				if err := meter.runTUI(stopTraffic, meta, *trafficInterval); err != nil {
+					fmt.Fprintf(os.Stderr, "tui failed, falling back to line output: %v\n", err)
+					meter.runLine(stopTraffic, *trafficInterval)
+				}
+				return
+			}
+			meter.runLine(stopTraffic, *trafficInterval)
 		}()
 	}
 	<-sigCh
@@ -422,7 +436,7 @@ func streamLog(stop <-chan struct{}, path string) {
 type trafficMeter struct {
 	upTotal   atomic.Uint64
 	downTotal atomic.Uint64
-	active    atomic.Uint64
+	active    atomic.Int64
 	accepted  atomic.Uint64
 }
 
@@ -438,61 +452,100 @@ type dashboardMeta struct {
 	Started  time.Time
 }
 
-func (m *trafficMeter) run(stop <-chan struct{}, dashboard bool, meta dashboardMeta) {
-	t := time.NewTicker(1 * time.Second)
+func (m *trafficMeter) runLine(stop <-chan struct{}, interval time.Duration) {
+	t := time.NewTicker(interval)
 	defer t.Stop()
-
-	if dashboard {
-		fmt.Print("\x1b[?25l") // hide cursor in dashboard mode
-	}
 
 	var prevUp uint64
 	var prevDown uint64
-	const histSize = 60
-	upHist := make([]uint64, 0, histSize)
-	downHist := make([]uint64, 0, histSize)
 	for {
 		select {
 		case <-stop:
-			if dashboard {
-				fmt.Print("\x1b[?25h\x1b[0m\n")
-			}
 			return
 		case <-t.C:
 			up := m.upTotal.Load()
 			down := m.downTotal.Load()
-			upRate := up - prevUp
-			downRate := down - prevDown
+			upRate := safeDelta(up, prevUp)
+			downRate := safeDelta(down, prevDown)
 			prevUp = up
 			prevDown = down
-			upHist = appendRate(upHist, upRate, histSize)
-			downHist = appendRate(downHist, downRate, histSize)
-			if dashboard {
-				fmt.Print("\x1b[H\x1b[2J")
-				fmt.Println("health-node live proxy dashboard")
-				fmt.Println()
-				fmt.Printf("listen       : %s (%s)\n", meta.Listen, meta.Inbound)
-				fmt.Printf("outbound     : %s\n", meta.Protocol)
-				fmt.Printf("core backend : %s\n", meta.CoreAddr)
-				fmt.Printf("uptime       : %s\n", time.Since(meta.Started).Truncate(time.Second))
-				fmt.Printf("connections  : active=%d total=%d\n", m.active.Load(), m.accepted.Load())
-				fmt.Println()
-				fmt.Printf("uplink rate  : %s/s\n", humanBytes(upRate))
-				fmt.Printf("downlink rate: %s/s\n", humanBytes(downRate))
-				fmt.Printf("uplink total : %s\n", humanBytes(up))
-				fmt.Printf("down total   : %s\n", humanBytes(down))
-				fmt.Println()
-				fmt.Println("up chart     :", renderRateChart(upHist))
-				fmt.Println("down chart   :", renderRateChart(downHist))
-				fmt.Println("              oldest <---------------------------> newest")
-				fmt.Println()
-				fmt.Println("Ctrl+C to stop")
-			} else {
-				fmt.Printf("[traffic] up=%s/s down=%s/s total_up=%s total_down=%s active=%d total_conn=%d\n",
-					humanBytes(upRate), humanBytes(downRate), humanBytes(up), humanBytes(down), m.active.Load(), m.accepted.Load())
-			}
+			fmt.Printf("[traffic] up=%s/s down=%s/s total_up=%s total_down=%s active=%d total_conn=%d\n",
+				humanBytes(upRate), humanBytes(downRate), humanBytes(up), humanBytes(down), m.active.Load(), m.accepted.Load())
 		}
 	}
+}
+
+func (m *trafficMeter) runTUI(stop <-chan struct{}, meta dashboardMeta, interval time.Duration) error {
+	app := tview.NewApplication()
+
+	info := tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignLeft)
+	info.SetBorder(true).SetTitle(" Proxy ")
+
+	stats := tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignLeft)
+	stats.SetBorder(true).SetTitle(" Traffic ")
+
+	hint := tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignLeft)
+	hint.SetBorder(true).SetTitle(" Controls ")
+	hint.SetText("[yellow]Stop with Ctrl+C")
+
+	root := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(info, 8, 0, false).
+		AddItem(stats, 8, 0, false).
+		AddItem(hint, 3, 0, false)
+
+	update := func(prevUp, prevDown uint64) (uint64, uint64) {
+		up := m.upTotal.Load()
+		down := m.downTotal.Load()
+		upRate := safeDelta(up, prevUp)
+		downRate := safeDelta(down, prevDown)
+
+		infoText := fmt.Sprintf(
+			"[green]listen:[white] %s (%s)\n[green]outbound:[white] %s\n[green]core backend:[white] %s\n[green]uptime:[white] %s",
+			meta.Listen, meta.Inbound, meta.Protocol, meta.CoreAddr, time.Since(meta.Started).Truncate(time.Second),
+		)
+		statsText := fmt.Sprintf(
+			"[green]connections active:[white] %d    [green]total:[white] %d\n"+
+				"[green]uplink rate:[white] %s/s\n"+
+				"[green]downlink rate:[white] %s/s\n"+
+				"[green]uplink total:[white] %s\n"+
+				"[green]downlink total:[white] %s",
+			m.active.Load(), m.accepted.Load(),
+			humanBytes(upRate), humanBytes(downRate),
+			humanBytes(up), humanBytes(down),
+		)
+
+		app.QueueUpdateDraw(func() {
+			info.SetText(infoText)
+			stats.SetText(statsText)
+		})
+		return up, down
+	}
+
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+
+		var prevUp, prevDown uint64
+		prevUp, prevDown = update(0, 0)
+		for {
+			select {
+			case <-stop:
+				app.Stop()
+				return
+			case <-t.C:
+				prevUp, prevDown = update(prevUp, prevDown)
+			}
+		}
+	}()
+
+	return app.SetRoot(root, true).SetFocus(root).Run()
 }
 
 func startRelay(listenAddr, targetAddr string, meter *trafficMeter) (func(), error) {
@@ -532,9 +585,9 @@ func startRelay(listenAddr, targetAddr string, meter *trafficMeter) (func(), err
 
 func relayConn(client net.Conn, targetAddr string, meter *trafficMeter) {
 	defer client.Close()
-	meter.accepted.Add(1)
+	addSaturating(&meter.accepted, 1)
 	meter.active.Add(1)
-	defer meter.active.Add(^uint64(0))
+	defer meter.active.Add(-1)
 
 	target, err := net.Dial("tcp", targetAddr)
 	if err != nil {
@@ -548,7 +601,7 @@ func relayConn(client net.Conn, targetAddr string, meter *trafficMeter) {
 		defer wg.Done()
 		n, _ := io.Copy(target, client)
 		if n > 0 {
-			meter.upTotal.Add(uint64(n))
+			addSaturating(&meter.upTotal, uint64(n))
 		}
 		if tc, ok := target.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
@@ -558,7 +611,7 @@ func relayConn(client net.Conn, targetAddr string, meter *trafficMeter) {
 		defer wg.Done()
 		n, _ := io.Copy(client, target)
 		if n > 0 {
-			meter.downTotal.Add(uint64(n))
+			addSaturating(&meter.downTotal, uint64(n))
 		}
 		if tc, ok := client.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
@@ -585,49 +638,35 @@ func humanBytes(n uint64) string {
 	}
 }
 
-func appendRate(hist []uint64, v uint64, max int) []uint64 {
-	hist = append(hist, v)
-	if len(hist) > max {
-		hist = hist[len(hist)-max:]
-	}
-	return hist
-}
-
-func renderRateChart(hist []uint64) string {
-	if len(hist) == 0 {
-		return "(no data)"
-	}
-	const levels = " .:-=+*#%@"
-	var max uint64
-	for _, v := range hist {
-		if v > max {
-			max = v
-		}
-	}
-	if max == 0 {
-		return strings.Repeat(".", len(hist))
-	}
-	out := make([]byte, len(hist))
-	last := len(levels) - 1
-	for i, v := range hist {
-		idx := int((v * uint64(last)) / max)
-		if idx < 0 {
-			idx = 0
-		}
-		if idx > last {
-			idx = last
-		}
-		out[i] = levels[idx]
-	}
-	return string(out)
-}
-
 func isInteractiveTTY() bool {
 	info, err := os.Stdout.Stat()
 	if err != nil {
 		return false
 	}
 	return (info.Mode() & os.ModeCharDevice) != 0
+}
+
+func safeDelta(curr, prev uint64) uint64 {
+	if curr >= prev {
+		return curr - prev
+	}
+	// Counter reset/wrap: avoid bogus spike.
+	return 0
+}
+
+func addSaturating(counter *atomic.Uint64, delta uint64) {
+	for {
+		cur := counter.Load()
+		if cur >= math.MaxUint64-delta {
+			if counter.CompareAndSwap(cur, math.MaxUint64) {
+				return
+			}
+			continue
+		}
+		if counter.CompareAndSwap(cur, cur+delta) {
+			return
+		}
+	}
 }
 
 func waitSocks(ctx context.Context, socksAddr string, timeout time.Duration) error {
