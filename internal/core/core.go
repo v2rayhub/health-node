@@ -51,7 +51,7 @@ func (r Runner) Start(ctx context.Context, outbound map[string]any) (*Started, e
 		"protocol": inboundProtocol,
 	}
 	if inboundProtocol == "socks" {
-		inbound["settings"] = map[string]any{"udp": false}
+		inbound["settings"] = map[string]any{"udp": true}
 	}
 
 	cfg := map[string]any{
