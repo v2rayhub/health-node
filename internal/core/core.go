@@ -65,11 +65,6 @@ func (r Runner) Start(ctx context.Context, outbound map[string]any) (*Started, e
 		},
 	}
 
-	body, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal core config: %w", err)
-	}
-
 	dir, err := os.MkdirTemp("", "proxy-node-")
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)
@@ -82,6 +77,10 @@ func (r Runner) Start(ctx context.Context, outbound map[string]any) (*Started, e
 		"loglevel": logLevel,
 		"access":   accessLogPath,
 		"error":    logPath,
+	}
+	body, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal core config: %w", err)
 	}
 	if err := os.WriteFile(configPath, body, 0o600); err != nil {
 		return nil, fmt.Errorf("write config: %w", err)
@@ -115,10 +114,18 @@ func (s *Started) Stop() {
 }
 
 func (s *Started) ReadLogTail() string {
-	if s == nil || s.LogPath == "" {
+	return s.readTailFile(s.LogPath)
+}
+
+func (s *Started) ReadAccessLogTail() string {
+	return s.readTailFile(s.AccessLogPath)
+}
+
+func (s *Started) readTailFile(path string) string {
+	if s == nil || path == "" {
 		return ""
 	}
-	b, err := os.ReadFile(s.LogPath)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}

@@ -30,6 +30,12 @@ import (
 	"proxy-node/internal/proxy"
 )
 
+const (
+	defaultProbeURL     = "https://www.cloudflare.com/cdn-cgi/trace"
+	defaultSpeedURL     = "https://speed.cloudflare.com/__down?bytes=10000000"
+	defaultSpeedRetries = 1
+)
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -93,11 +99,12 @@ Common flags:
   --timeout duration    timeout for startup and checks (default: 20s)
 
 Probe flags:
-  --url string          probe URL (default: https://www.gstatic.com/generate_204)
+  --url string          probe URL (default: https://www.cloudflare.com/cdn-cgi/trace)
 
 Speed flags:
-  --url string          download URL (default: https://speed.hetzner.de/10MB.bin)
+  --url string          download URL (default: https://speed.cloudflare.com/__down?bytes=10000000)
   --max-bytes int       stop after N bytes (0 means full response)
+  --retries int         retry count on failure (default: 1)
 
 Proxy flags:
   --inbound string      inbound protocol: socks|http (default: socks)
@@ -119,7 +126,7 @@ func runProbe(args []string) error {
 	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
 	uri := fs.String("uri", "", "VLESS/VMess URI")
 	corePath := fs.String("core", "", "core binary path")
-	probeURL := fs.String("url", "https://www.gstatic.com/generate_204", "probe URL")
+	probeURL := fs.String("url", defaultProbeURL, "probe URL")
 	timeout := fs.Duration("timeout", 20*time.Second, "timeout")
 	localPort := fs.Int("local-socks", 0, "local socks port")
 	if err := fs.Parse(args); err != nil {
@@ -158,12 +165,12 @@ func runProbe(args []string) error {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	if err := waitSocks(ctx, socksAddr, *timeout); err != nil {
-		return fmt.Errorf("core did not become ready: %w\ncore log tail:\n%s", err, started.ReadLogTail())
+		return fmt.Errorf("core did not become ready: %w\n%s", err, coreLogTails(started))
 	}
 
 	latency, code, n, err := probeHTTP(ctx, socksAddr, *probeURL, *timeout)
 	if err != nil {
-		return fmt.Errorf("probe request failed: %w\ncore log tail:\n%s", err, started.ReadLogTail())
+		return fmt.Errorf("probe request failed: %w\n%s", err, coreLogTails(started))
 	}
 
 	fmt.Printf("status=ok protocol=%s code=%d latency_ms=%d bytes=%d\n", prov.Name(), code, latency.Milliseconds(), n)
@@ -174,8 +181,9 @@ func runSpeed(args []string) error {
 	fs := flag.NewFlagSet("speed", flag.ContinueOnError)
 	uri := fs.String("uri", "", "VLESS/VMess URI")
 	corePath := fs.String("core", "", "core binary path")
-	speedURL := fs.String("url", "https://speed.hetzner.de/10MB.bin", "speed test URL")
+	speedURL := fs.String("url", defaultSpeedURL, "speed test URL")
 	maxBytes := fs.Int64("max-bytes", 10*1024*1024, "max bytes to download (0 for full)")
+	retries := fs.Int("retries", defaultSpeedRetries, "retry count on failure")
 	timeout := fs.Duration("timeout", 45*time.Second, "timeout")
 	localPort := fs.Int("local-socks", 0, "local socks port")
 	if err := fs.Parse(args); err != nil {
@@ -183,6 +191,9 @@ func runSpeed(args []string) error {
 	}
 	if *uri == "" {
 		return errors.New("--uri is required")
+	}
+	if *retries < 1 {
+		return errors.New("--retries must be >= 1")
 	}
 	resolvedCore, err := resolveCorePath(*corePath)
 	if err != nil {
@@ -214,15 +225,27 @@ func runSpeed(args []string) error {
 
 	socksAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	if err := waitSocks(ctx, socksAddr, *timeout); err != nil {
-		return fmt.Errorf("core did not become ready: %w\ncore log tail:\n%s", err, started.ReadLogTail())
+		return fmt.Errorf("core did not become ready: %w\n%s", err, coreLogTails(started))
 	}
 
-	bytesRead, elapsed, err := speedHTTP(ctx, socksAddr, *speedURL, *maxBytes, *timeout)
+	bytesRead, elapsed, attempt, partialErr, err := speedHTTPWithRetries(
+		ctx,
+		*retries,
+		func(attemptCtx context.Context) (int64, time.Duration, error) {
+			return speedHTTP(attemptCtx, socksAddr, *speedURL, *maxBytes, *timeout)
+		},
+	)
 	if err != nil {
-		return fmt.Errorf("speed request failed: %w\ncore log tail:\n%s", err, started.ReadLogTail())
+		return fmt.Errorf("speed request failed: %w\n%s", err, coreLogTails(started))
 	}
 	mbps := (float64(bytesRead) * 8) / elapsed.Seconds() / 1_000_000
-	fmt.Printf("status=ok protocol=%s bytes=%d elapsed_ms=%d mbps=%.2f\n", prov.Name(), bytesRead, elapsed.Milliseconds(), mbps)
+	if partialErr != nil {
+		fmt.Printf("status=partial protocol=%s bytes=%d elapsed_ms=%d mbps=%.2f attempts=%d error=%q\n",
+			prov.Name(), bytesRead, elapsed.Milliseconds(), mbps, attempt, partialErr.Error())
+		return nil
+	}
+	fmt.Printf("status=ok protocol=%s bytes=%d elapsed_ms=%d mbps=%.2f attempts=%d\n",
+		prov.Name(), bytesRead, elapsed.Milliseconds(), mbps, attempt)
 	return nil
 }
 
@@ -333,7 +356,7 @@ func runProxy(args []string, defaultInbound string) error {
 	startupCtx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	if err := waitSocks(startupCtx, coreAddr, *timeout); err != nil {
-		return fmt.Errorf("core did not become ready: %w\ncore log tail:\n%s", err, started.ReadLogTail())
+		return fmt.Errorf("core did not become ready: %w\n%s", err, coreLogTails(started))
 	}
 
 	stopRelay := func() {}
@@ -431,6 +454,13 @@ func streamLog(stop <-chan struct{}, path string) {
 		offset = info.Size()
 		_ = f.Close()
 	}
+}
+
+func coreLogTails(started *core.Started) string {
+	if started == nil {
+		return "core logs unavailable"
+	}
+	return fmt.Sprintf("core error log tail:\n%s\ncore access log tail:\n%s", started.ReadLogTail(), started.ReadAccessLogTail())
 }
 
 type trafficMeter struct {
@@ -725,15 +755,43 @@ func speedHTTP(ctx context.Context, socksAddr, rawURL string, maxBytes int64, ti
 	if maxBytes > 0 {
 		n, err = io.CopyN(io.Discard, resp.Body, maxBytes)
 		if err != nil && !errors.Is(err, io.EOF) {
-			return 0, 0, err
+			return n, time.Since(start), err
 		}
 	} else {
 		n, err = io.Copy(io.Discard, resp.Body)
 		if err != nil {
-			return 0, 0, err
+			return n, time.Since(start), err
 		}
 	}
 	return n, time.Since(start), nil
+}
+
+func speedHTTPWithRetries(
+	ctx context.Context,
+	maxAttempts int,
+	attemptFn func(context.Context) (int64, time.Duration, error),
+) (int64, time.Duration, int, error, error) {
+	var lastErr error
+	for i := 1; i <= maxAttempts; i++ {
+		n, elapsed, err := attemptFn(ctx)
+		if err == nil {
+			return n, elapsed, i, nil, nil
+		}
+		if n > 0 && elapsed > 0 {
+			return n, elapsed, i, err, nil
+		}
+		lastErr = err
+		if i == maxAttempts {
+			break
+		}
+		wait := time.Duration(i) * 300 * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return 0, 0, i, nil, ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return 0, 0, maxAttempts, nil, fmt.Errorf("all %d attempts failed: %w", maxAttempts, lastErr)
 }
 
 func httpClientThroughSocks(socksAddr string, timeout time.Duration) *http.Client {

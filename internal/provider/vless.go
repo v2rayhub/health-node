@@ -113,7 +113,7 @@ func (v *VLESS) Outbound() (map[string]any, error) {
 		reality := map[string]any{
 			"fingerprint": valueOrDefault(v.Fingerprint, "chrome"),
 			"serverName":  firstNonEmpty(v.SNI, v.Host, v.Address),
-			"password":    v.PublicKey,
+			"publicKey":   v.PublicKey,
 			"shortId":     v.ShortID,
 			"spiderX":     v.SpiderX,
 		}

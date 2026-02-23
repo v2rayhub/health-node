@@ -175,8 +175,8 @@ func TestVLESSOutbound_RealitySettingsPresent(t *testing.T) {
 	if got := reality["serverName"]; got != "aparat.com" {
 		t.Fatalf("reality.serverName = %#v, want aparat.com", got)
 	}
-	if got := reality["password"]; got != "PUBKEY123" {
-		t.Fatalf("reality.password = %#v, want PUBKEY123", got)
+	if got := reality["publicKey"]; got != "PUBKEY123" {
+		t.Fatalf("reality.publicKey = %#v, want PUBKEY123", got)
 	}
 	if got := reality["shortId"]; got != "abcd1234" {
 		t.Fatalf("reality.shortId = %#v, want abcd1234", got)
